@@ -11,7 +11,9 @@ Measures water depth (via analog sensor) + temperature
 
 ## Setup
 
-1. Flash `pico/main.py` to Pico W (Thonny / rshell / ampy)
+1. Flash `main.py` to Pico W (Thonny / rshell / ampy) using the Raspberry Pi Pico code.
 2. Update `SSID`, `PASSWORD`, `SERVER_IP` in `main.py`
-3. Run Flask server: `python app.py`
-4. Open http://your-pc-ip:8080/
+3. In terminal: nano tanklevelindicator.py, paste PC code inside and save.
+4. Run Pico code.
+5. On PC, python3 tanklevelindicator.py
+6. Open http://your-pc-ip:8080/
