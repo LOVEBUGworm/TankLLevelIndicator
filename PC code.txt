@@ -1,0 +1,197 @@
+from flask import Flask, jsonify, render_template_string, request
+import socket, json, threading, time
+
+app = Flask(__name__)
+
+latest_data = {}
+history = []
+HISTORY_MAX = 120
+
+# ===== Calibration values =====
+v1, d1 = 0.0, 0.0
+v2, d2 = 3.0, 38.5
+MAX_DEPTH = 40
+
+def voltage_to_depth(v):
+    global v1, d1, v2, d2
+    if v2 == v1:
+        return 0
+    A = (d2 - d1) / (v2 - v1)
+    B = d1 - A * v1
+    depth = A * v + B
+    return max(0, min(depth, MAX_DEPTH))
+
+# ===== Pico listener =====
+def pico_listener():
+    HOST = "0.0.0.0"
+    PORT = 5000
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind((HOST, PORT))
+    s.listen(5)
+    print(f"📡 Listening for Pico data on {HOST}:{PORT}...")
+
+    while True:
+        conn, addr = s.accept()
+        try:
+            data = conn.recv(1024).decode()
+            obj = json.loads(data)
+
+            global latest_data, history
+
+            # calculate depth on PC
+            if "voltage" in obj:
+                obj["depth"] = voltage_to_depth(obj["voltage"])
+
+            latest_data = obj.copy()  # ✅ now includes depth
+
+            obj["timestamp"] = time.strftime("%H:%M:%S")
+            history.append(obj)
+            if len(history) > HISTORY_MAX:
+                history.pop(0)
+
+            print("💧 Received:", obj)
+
+        except Exception as e:
+            print("❌ Error:", e)
+
+        finally:
+            conn.send(b"OK")
+            conn.close()
+
+threading.Thread(target=pico_listener, daemon=True).start()
+
+# ===== Web UI =====
+HTML_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Smart Water Tank</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+body{font-family:sans-serif;background:#0f172a;color:#e5e7eb;text-align:center;padding:20px;}
+canvas{background:#111827;border-radius:12px;margin-top:20px;}
+button,input{padding:8px;margin:5px;border-radius:6px;border:none;}
+button{background:#2563eb;color:white;}
+.stats{margin-top:15px;font-size:1.3em;}
+small{opacity:0.7}
+</style>
+</head>
+<body>
+<h1>💧 Smart Water Tank</h1>
+
+<div class="stats">
+Depth: <span id="depth">--</span> in |
+Voltage: <span id="voltage">--</span> V |
+Temp: <span id="temp">--</span> °F
+</div>
+
+<div>
+<input id="depthInput" placeholder="Actual depth (inches)">
+<button onclick="cal1()">Cal Point 1</button>
+<button onclick="cal2()">Cal Point 2</button>
+</div>
+
+<small>
+Cal1 = (v1=<span id="v1">--</span>, d1=<span id="d1">--</span>) |
+Cal2 = (v2=<span id="v2">--</span>, d2=<span id="d2">--</span>)
+</small>
+
+<canvas id="chart"></canvas>
+
+<script>
+let chart;
+
+async function fetchData(){
+    let r = await fetch('/api/current');
+    let d = await r.json();
+
+    if(d.depth !== undefined) document.getElementById("depth").innerText = d.depth.toFixed(2);
+    if(d.voltage !== undefined) document.getElementById("voltage").innerText = d.voltage.toFixed(4);
+    if(d.temp_f !== undefined) document.getElementById("temp").innerText = d.temp_f.toFixed(1);
+
+    let c = await fetch('/api/cal');
+    let cal = await c.json();
+    document.getElementById("v1").innerText = cal.v1.toFixed(4);
+    document.getElementById("d1").innerText = cal.d1.toFixed(2);
+    document.getElementById("v2").innerText = cal.v2.toFixed(4);
+    document.getElementById("d2").innerText = cal.d2.toFixed(2);
+
+    let r2 = await fetch('/api/history');
+    let h = await r2.json();
+    const labels = h.map(x => x.timestamp);
+    const depths = h.map(x => x.depth);
+    const temps = h.map(x => x.temp_f);
+
+    if(chart) chart.destroy();
+    const ctx = document.getElementById('chart').getContext('2d');
+    chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [
+                {label: 'Depth (in)', data: depths, borderColor:'#00d4ff', tension:0.2},
+                {label: 'Temp (°F)', data: temps, borderColor:'#ff9900', tension:0.2}
+            ]
+        },
+        options: {responsive:true, animation:false}
+    });
+}
+
+async function cal1(){
+    let x = document.getElementById("depthInput").value;
+    let r = await fetch(`/api/cal1?depth=${x}`);
+    alert(await r.text());
+}
+
+async function cal2(){
+    let x = document.getElementById("depthInput").value;
+    let r = await fetch(`/api/cal2?depth=${x}`);
+    alert(await r.text());
+}
+
+setInterval(fetchData, 2000);
+fetchData();
+</script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_PAGE)
+
+@app.route('/api/current')
+def api_current():
+    return jsonify(latest_data)
+
+@app.route('/api/history')
+def api_history():
+    return jsonify(history)
+
+@app.route('/api/cal')
+def api_cal():
+    return jsonify({"v1":v1,"d1":d1,"v2":v2,"d2":d2})
+
+@app.route('/api/cal1')
+def api_cal1():
+    global v1, d1
+    depth = request.args.get('depth', type=float)
+    if depth is None or "voltage" not in latest_data:
+        return "❌ No voltage data"
+    v1 = latest_data["voltage"]
+    d1 = depth
+    return f"✅ Cal1 set: v1={v1:.4f}, d1={d1}"
+
+@app.route('/api/cal2')
+def api_cal2():
+    global v2, d2
+    depth = request.args.get('depth', type=float)
+    if depth is None or "voltage" not in latest_data:
+        return "❌ No voltage data"
+    v2 = latest_data["voltage"]
+    d2 = depth
+    return f"✅ Cal2 set: v2={v2:.4f}, d2={d2}"
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
