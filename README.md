@@ -6,7 +6,7 @@ Measures water depth (via analog sensor) + temperature
 
 ## Hardware
 - Raspberry Pi Pico W
-- Analog depth sensor (e.g. resistive or ultrasonic → voltage)
+- Analog depth sensor (ALS-MPM-2F Water Level Transmitter)
 - Temperature sensor (e.g. DS18B20 or onboard)
 
 ## Setup
