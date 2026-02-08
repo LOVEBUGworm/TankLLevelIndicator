@@ -16,4 +16,4 @@ Measures water depth (via analog sensor) + temperature
 3. In terminal: nano tanklevelindicator.py, paste PC code inside and save.
 4. Run Pico code.
 5. On PC, python3 tanklevelindicator.py
-6. Open http://your-pc-ip:8080/
+6. Open http://your-pc-ip:5000/
