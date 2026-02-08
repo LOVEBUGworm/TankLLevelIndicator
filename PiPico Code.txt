@@ -11,7 +11,7 @@ PASSWORD = "Password"
 
 # ===== SERVER SETTINGS (your computer IP) =====
 SERVER_IP = "192.168.0.x" #192.168.1.x
-SERVER_PORT = 8080  # Changed to match Flask server port
+SERVER_PORT = 5000  # Changed to match Flask server port
 
 # ===== ADC SETUP =====
 adc = ADC(26)  # GPIO26 = ADC0 on Pico
