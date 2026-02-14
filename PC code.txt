@@ -1,197 +1,497 @@
-from flask import Flask, jsonify, render_template_string, request
-import socket, json, threading, time
+from flask import Flask, request, jsonify
+import os
+import json
+import time
+from datetime import date
+from threading import Lock
 
 app = Flask(__name__)
 
-latest_data = {}
-history = []
-HISTORY_MAX = 120
+# ─── CONSTANTS ────────────────────────────────────────────────
+TANK_DEPTH_CM   = 38.0
+V_EMPTY         = 0.0
+V_FULL          = 2.98882
+VOLTAGE_MAX     = 3.2
+FILTER_ALPHA    = 0.07
 
-# ===== Calibration values =====
-v1, d1 = 0.0, 0.0
-v2, d2 = 3.0, 38.5
-MAX_DEPTH = 40
+TANK4_DEPTH_IN  = 37.5
+ULTRA_FILTER_ALPHA = 0.2
 
-def voltage_to_depth(v):
-    global v1, d1, v2, d2
-    if v2 == v1:
-        return 0
-    A = (d2 - d1) / (v2 - v1)
-    B = d1 - A * v1
-    depth = A * v + B
-    return max(0, min(depth, MAX_DEPTH))
+LOG_DIR = "logs"
+MAX_LOG_DAYS = 7
+os.makedirs(LOG_DIR, exist_ok=True)
 
-# ===== Pico listener =====
-def pico_listener():
-    HOST = "0.0.0.0"
-    PORT = 5000
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind((HOST, PORT))
-    s.listen(5)
-    print(f"📡 Listening for Pico data on {HOST}:{PORT}...")
+# ─── STATE ─────────────────────────────────────────────────────
+stats_lock = Lock()
+file_lock  = Lock()
 
-    while True:
-        conn, addr = s.accept()
-        try:
-            data = conn.recv(1024).decode()
-            obj = json.loads(data)
+smoothed_voltage = None
+ultra_smoothed = None
 
-            global latest_data, history
+stats = {
+    "min_v": None, "max_v": None,
+    "min_depth": None, "max_depth": None,
+    "min_pct": None, "max_pct": None,
+    "min_up": None, "max_up": None
+}
 
-            # calculate depth on PC
-            if "voltage" in obj:
-                obj["depth"] = voltage_to_depth(obj["voltage"])
+# ─── HELPERS ───────────────────────────────────────────────────
+def today_filename():
+    return os.path.join(LOG_DIR, date.today().isoformat() + ".json")
 
-            latest_data = obj.copy()  # ✅ now includes depth
+def cleanup_old_logs():
+    with file_lock:
+        files = sorted(f for f in os.listdir(LOG_DIR) if f.endswith(".json"))
+        while len(files) > MAX_LOG_DAYS:
+            try:
+                os.remove(os.path.join(LOG_DIR, files.pop(0)))
+            except:
+                pass
 
-            obj["timestamp"] = time.strftime("%H:%M:%S")
-            history.append(obj)
-            if len(history) > HISTORY_MAX:
-                history.pop(0)
+def safe_filter_voltage(raw):
+    global smoothed_voltage
+    try:
+        clamped = max(0.0, min(float(raw), VOLTAGE_MAX))
+    except:
+        clamped = 0.0
+    if smoothed_voltage is None:
+        smoothed_voltage = clamped
+    else:
+        smoothed_voltage = FILTER_ALPHA * clamped + (1 - FILTER_ALPHA) * smoothed_voltage
+    return smoothed_voltage
 
-            print("💧 Received:", obj)
+def safe_filter_ultra(raw):
+    global ultra_smoothed
+    try:
+        val = float(raw)
+    except:
+        val = 0.0
+    if ultra_smoothed is None:
+        ultra_smoothed = val
+    else:
+        ultra_smoothed = ULTRA_FILTER_ALPHA * val + (1 - ULTRA_FILTER_ALPHA) * ultra_smoothed
+    return ultra_smoothed
 
-        except Exception as e:
-            print("❌ Error:", e)
+def voltage_to_depth_pct(v):
+    if V_FULL <= V_EMPTY:
+        return 0.0, 0.0
+    depth = (v - V_EMPTY) / (V_FULL - V_EMPTY) * TANK_DEPTH_CM
+    depth = max(0.0, min(depth, TANK_DEPTH_CM))
+    pct = (depth / TANK_DEPTH_CM) * 100
+    return depth, pct
 
-        finally:
-            conn.send(b"OK")
-            conn.close()
+def update_stats(v, d, p, up):
+    with stats_lock:
+        def upd(key, val, mode="min"):
+            if val is None: return
+            if stats[key] is None:
+                stats[key] = val
+            elif (mode == "min" and val < stats[key]) or (mode == "max" and val > stats[key]):
+                stats[key] = val
+        upd("min_v", v, "min")
+        upd("max_v", v, "max")
+        upd("min_depth", d, "min")
+        upd("max_depth", d, "max")
+        upd("min_pct", p, "min")
+        upd("max_pct", p, "max")
+        upd("min_up", up, "min")
+        upd("max_up", up, "max")
 
-threading.Thread(target=pico_listener, daemon=True).start()
+# ─── API ───────────────────────────────────────────────────────
+@app.route("/api/data", methods=["POST"])
+def receive_data():
+    payload = request.get_json(silent=True)
+    if not payload:
+        return jsonify({"error": "missing payload"}), 400
 
-# ===== Web UI =====
-HTML_PAGE = """
+    raw_v = payload.get("value")
+    raw_ultra = payload.get("ultra")
+
+    smooth_v = safe_filter_voltage(raw_v) if raw_v is not None else 0
+    depth, pct = voltage_to_depth_pct(smooth_v)
+
+    if raw_ultra is not None:
+        smooth_ultra = safe_filter_ultra(raw_ultra)
+        tank4_depth = max(0.0, min(TANK4_DEPTH_IN - smooth_ultra, TANK4_DEPTH_IN))
+        tank4_pct = (tank4_depth / TANK4_DEPTH_IN) * 100
+    else:
+        tank4_depth = None
+        tank4_pct = None
+
+    update_stats(smooth_v, depth, pct, tank4_pct)
+
+    entry = {
+        "t": time.time(),
+        "v": round(smooth_v, 4),
+        "d": round(depth, 2),
+        "p": round(pct, 1),
+        "u": round(tank4_depth, 2) if tank4_depth is not None else None,
+        "up": round(tank4_pct, 1) if tank4_pct is not None else None
+    }
+
+    fname = today_filename()
+    with file_lock:
+        data = []
+        if os.path.exists(fname):
+            try:
+                with open(fname, "r") as f:
+                    data = json.load(f)
+            except:
+                data = []
+        data.append(entry)
+        with open(fname, "w") as f:
+            json.dump(data, f, separators=(",", ":"))
+
+    cleanup_old_logs()
+    return jsonify({"status": "ok"})
+
+@app.route("/api/current")
+def get_current():
+    fname = today_filename()
+    entries = []
+    if os.path.exists(fname):
+        with open(fname, "r") as f:
+            entries = json.load(f)
+    return jsonify({"data": entries, "stats": stats})
+
+@app.route("/api/history/<day>")
+def get_history(day):
+    path = os.path.join(LOG_DIR, f"{day}.json")
+    if not os.path.exists(path):
+        return jsonify([])
+    with open(path, "r") as f:
+        return jsonify(json.load(f))
+
+@app.route("/api/days")
+def list_days():
+    days = [f[:-5] for f in os.listdir(LOG_DIR) if f.endswith(".json")]
+    return jsonify(sorted(days))
+
+# ─── UI ────────────────────────────────────────────────────────
+HTML = """
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>Smart Water Tank</title>
+<title>🔥 Tr@ck33r's TANK SCADA - Cyber Edition</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
 <style>
-body{font-family:sans-serif;background:#0f172a;color:#e5e7eb;text-align:center;padding:20px;}
-canvas{background:#111827;border-radius:12px;margin-top:20px;}
-button,input{padding:8px;margin:5px;border-radius:6px;border:none;}
-button{background:#2563eb;color:white;}
-.stats{margin-top:15px;font-size:1.3em;}
-small{opacity:0.7}
+/* ===== BACKGROUND GRID ===== */
+#bgCanvas {
+  position: fixed;
+  top:0; left:0;
+  z-index:0;
+  width:100%;
+  height:100%;
+  pointer-events:none;
+}
+
+/* ===== BODY & PANELS ===== */
+body {
+  font-family: monospace;
+  background: #010916;
+  color: #0ff;
+  display: flex;
+  flex-wrap: wrap;
+  gap:20px;
+  padding:20px;
+  position: relative;
+}
+
+.panel {
+  flex:1 1 350px;
+  min-width:300px;
+  background: rgba(0,20,40,0.6);
+  backdrop-filter: blur(6px);
+  border-radius:16px;
+  padding:20px;
+  box-shadow: 0 0 20px #0ff66;
+  border: 1px solid #0ff;
+  position: relative;
+  z-index:1;
+}
+
+/* ===== TABLES ===== */
+table {
+  border-collapse: separate;
+  border-spacing:0;
+  width:100%;
+}
+td { padding:8px 12px; border-bottom:1px solid rgba(0,255,255,0.2);}
+td.label{opacity:0.7;}
+td.value{font-weight:bold;color:#fff;}
+
+/* ===== BUTTONS & SELECT ===== */
+button, select {
+  background: linear-gradient(90deg,#0ff,#4ade80);
+  border:1px solid #0ff;
+  color:#010916;
+  font-weight:bold;
+  border-radius:8px;
+  box-shadow:0 0 6px #0ff;
+  padding:6px 10px;
+  margin-right:6px;
+  cursor:pointer;
+  transition: all 0.2s;
+}
+button:hover{box-shadow:0 0 12px #4ade80;transform:scale(1.05);}
+
+/* ===== CHART ===== */
+canvas{background: rgba(0,20,40,0.4); border-radius:12px;}
+
+/* ===== HEADINGS ===== */
+h2{text-shadow:0 0 6px #0ff; margin-bottom:12px;}
+
+/* ===== MODE LABEL ===== */
+#modeLabel{margin-top:12px;font-weight:bold;color:#0ff;text-shadow:0 0 4px #0ff;}
+
+/* ===== WATER BARS ===== */
+.tank-bar-container {
+  position: relative;
+  width:50px;
+  height:150px;
+  background: rgba(0,20,40,0.4);
+  border:2px solid #0ff;
+  border-radius:12px;
+  margin:10px 0;
+  overflow:hidden;
+}
+.tank-bar-fill {
+  position: absolute;
+  bottom:0;
+  width:100%;
+  height:0%;
+  background: linear-gradient(to top,#60a5fa,#4ade80);
+  box-shadow:0 0 10px #4ade80;
+  transition: height 0.8s ease-out;
+  border-radius:8px 8px 0 0;
+}
+#tank4-fill {
+  background: linear-gradient(to top,#ff4df0,#ffaf00);
+  box-shadow:0 0 10px #ff4df0;
+}
+
+/* ===== SCROLL BAR ===== */
+#scroll{width:100%; margin:10px 0;}
 </style>
 </head>
 <body>
-<h1>💧 Smart Water Tank</h1>
 
-<div class="stats">
-Depth: <span id="depth">--</span> in |
-Voltage: <span id="voltage">--</span> V |
-Temp: <span id="temp">--</span> °F
+<canvas id="bgCanvas"></canvas>
+
+<!-- SIDE PANEL (slightly constrained width now) -->
+<div class="panel" style="flex:0.1; max-width:420px;">
+  <h2>💧 Tank 3</h2>
+  <div class="tank-bar-container"><div id="tank3-fill" class="tank-bar-fill"></div></div>
+  <table>
+    <tr><td class="label">Voltage</td><td class="value" id="v">--</td></tr>
+    <tr><td class="label">Depth (in)</td><td class="value" id="d">--</td></tr>
+    <tr><td class="label">Percent</td><td class="value" id="p">--</td></tr>
+  </table>
+
+  <h2 style="margin-top:20px;">🌊 Tank 2</h2>
+  <div class="tank-bar-container"><div id="tank4-fill" class="tank-bar-fill"></div></div>
+  <table>
+    <tr><td class="label">Depth (in)</td><td class="value" id="u">--</td></tr>
+    <tr><td class="label">Percent</td><td class="value" id="up">--</td></tr>
+  </table>
+
+  <hr>
+  <button onclick="backToLive()">🟢 LIVE</button>
+  <select id="daylist"></select>
+  <button onclick="loadDay()">📅 LOAD DAY</button>
+  <button onclick="chart.resetZoom()">🔄 Reset Zoom</button>
+  <input type="range" id="scroll" min="0" max="100" value="100">
+  <div id="modeLabel">Mode: LIVE</div>
 </div>
 
-<div>
-<input id="depthInput" placeholder="Actual depth (inches)">
-<button onclick="cal1()">Cal Point 1</button>
-<button onclick="cal2()">Cal Point 2</button>
+<!-- GRAPH PANEL (bigger now) -->
+<div class="panel" style="flex:4.3;">
+  <h2>📈 Tank Graphs</h2>
+  <canvas id="chart"></canvas>
 </div>
-
-<small>
-Cal1 = (v1=<span id="v1">--</span>, d1=<span id="d1">--</span>) |
-Cal2 = (v2=<span id="v2">--</span>, d2=<span id="d2">--</span>)
-</small>
-
-<canvas id="chart"></canvas>
 
 <script>
+/* ===== BACKGROUND GRID ANIMATION ===== */
+const bgCanvas = document.getElementById('bgCanvas');
+const ctx = bgCanvas.getContext('2d');
+let w = bgCanvas.width = window.innerWidth;
+let h = bgCanvas.height = window.innerHeight;
+const gridSpacing = 60;
+let pulseOffset = 0;
+
+window.addEventListener('resize',()=>{ w=bgCanvas.width=window.innerWidth; h=bgCanvas.height=window.innerHeight; });
+
+function drawGrid(){
+  ctx.clearRect(0,0,w,h);
+
+  ctx.strokeStyle='rgba(0,255,255,0.15)';
+  ctx.lineWidth=1;
+  for(let x=0;x<=w;x+=gridSpacing){
+    ctx.beginPath();
+    ctx.moveTo(x+(pulseOffset%gridSpacing),0);
+    ctx.lineTo(x+(pulseOffset%gridSpacing),h);
+    ctx.stroke();
+  }
+  for(let y=0;y<=h;y+=gridSpacing){
+    ctx.beginPath();
+    ctx.moveTo(0,y+(pulseOffset%gridSpacing));
+    ctx.lineTo(w,y+(pulseOffset%gridSpacing));
+    ctx.stroke();
+  }
+
+  ctx.strokeStyle='rgba(0,255,255,0.25)';
+  ctx.lineWidth=2;
+  for(let i=0;i<10;i++){
+    let posY = ((i*gridSpacing*2 + pulseOffset*2) % h);
+    ctx.beginPath();
+    ctx.moveTo(0,posY);
+    ctx.lineTo(w,posY);
+    ctx.stroke();
+  }
+
+  pulseOffset +=0.5;
+  requestAnimationFrame(drawGrid);
+}
+drawGrid();
+
+/* ===== DASHBOARD DATA & CHARTS ===== */
 let chart;
+let fullHistory=[];
+let mode="live";
+const scroll = document.getElementById("scroll");
 
-async function fetchData(){
-    let r = await fetch('/api/current');
-    let d = await r.json();
+async function fetchLive(){
+  if(mode!=="live") return;
+  try{
+    let r = await fetch("/api/current");
+    let j = await r.json();
+    fullHistory = j.data || [];
+    updateLatest();
+    drawChart();
+  }catch(e){ console.error("fetchLive failed:",e);}
+}
+setInterval(fetchLive,2000);
 
-    if(d.depth !== undefined) document.getElementById("depth").innerText = d.depth.toFixed(2);
-    if(d.voltage !== undefined) document.getElementById("voltage").innerText = d.voltage.toFixed(4);
-    if(d.temp_f !== undefined) document.getElementById("temp").innerText = d.temp_f.toFixed(1);
-
-    let c = await fetch('/api/cal');
-    let cal = await c.json();
-    document.getElementById("v1").innerText = cal.v1.toFixed(4);
-    document.getElementById("d1").innerText = cal.d1.toFixed(2);
-    document.getElementById("v2").innerText = cal.v2.toFixed(4);
-    document.getElementById("d2").innerText = cal.d2.toFixed(2);
-
-    let r2 = await fetch('/api/history');
-    let h = await r2.json();
-    const labels = h.map(x => x.timestamp);
-    const depths = h.map(x => x.depth);
-    const temps = h.map(x => x.temp_f);
-
-    if(chart) chart.destroy();
-    const ctx = document.getElementById('chart').getContext('2d');
-    chart = new Chart(ctx, {
-        type: 'line',
-        data: {
-            labels: labels,
-            datasets: [
-                {label: 'Depth (in)', data: depths, borderColor:'#00d4ff', tension:0.2},
-                {label: 'Temp (°F)', data: temps, borderColor:'#ff9900', tension:0.2}
-            ]
-        },
-        options: {responsive:true, animation:false}
+async function loadDays(){
+  try{
+    let r = await fetch("/api/days");
+    let days = await r.json();
+    daylist.innerHTML="";
+    days.forEach(d=>{
+      let o=document.createElement("option");
+      o.value=d; o.textContent=d;
+      daylist.appendChild(o);
     });
+  }catch(e){console.error(e);}
+}
+loadDays();
+
+async function loadDay(){
+  let d = daylist.value;
+  if(!d) return;
+  mode="history";
+  let r = await fetch("/api/history/"+d);
+  fullHistory = await r.json();
+  updateLatest();
+  drawChart();
+  modeLabel.innerText="Mode: HISTORY ("+d+")";
+}
+function backToLive(){
+  mode="live";
+  modeLabel.innerText="Mode: LIVE";
 }
 
-async function cal1(){
-    let x = document.getElementById("depthInput").value;
-    let r = await fetch(`/api/cal1?depth=${x}`);
-    alert(await r.text());
+function updateWaterBars(){
+  if(fullHistory.length===0) return;
+  let l=fullHistory[fullHistory.length-1];
+  if(l.p!=null) document.getElementById("tank3-fill").style.height=l.p+"%";
+  if(l.up!=null) document.getElementById("tank4-fill").style.height=l.up+"%";
+}
+function updateLatest(){
+  if(fullHistory.length===0) return;
+  let l=fullHistory[fullHistory.length-1];
+  v.innerText=l.v.toFixed(4);
+  d.innerText=l.d.toFixed(2);
+  p.innerText=l.p.toFixed(1)+"%";
+  if(l.u!=null) u.innerText=l.u.toFixed(2);
+  if(l.up!=null) up.innerText=l.up.toFixed(1)+"%";
+  updateWaterBars();
 }
 
-async function cal2(){
-    let x = document.getElementById("depthInput").value;
-    let r = await fetch(`/api/cal2?depth=${x}`);
-    alert(await r.text());
+function drawChart(){
+  let labels = fullHistory.map(x=>new Date(x.t*1000).toLocaleTimeString());
+  let volt = fullHistory.map(x=>x.v);
+  let depth = fullHistory.map(x=>x.d);
+  let pct = fullHistory.map(x=>x.p);
+  let ultra = fullHistory.map(x=>x.u);
+  let up = fullHistory.map(x=>x.up);
+
+  let total = fullHistory.length;
+  if(total>20){
+    let windowSize = Math.max(Math.floor(total*0.2),20);
+    let start = Math.floor((scroll.value/100)*(total-windowSize));
+    labels = labels.slice(start,start+windowSize);
+    volt = volt.slice(start,start+windowSize);
+    depth = depth.slice(start,start+windowSize);
+    pct = pct.slice(start,start+windowSize);
+    ultra = ultra.slice(start,start+windowSize);
+    up = up.slice(start,start+windowSize);
+  }
+
+  if(chart){
+    chart.data.labels=labels;
+    chart.data.datasets[0].data=volt;
+    chart.data.datasets[1].data=depth;
+    chart.data.datasets[2].data=pct;
+    chart.data.datasets[3].data=ultra;
+    chart.data.datasets[4].data=up;
+    chart.update("none");
+    return;
+  }
+
+  chart = new Chart(document.getElementById("chart"),{
+    type:"line",
+    data:{
+      labels:labels,
+      datasets:[
+        {label:"Voltage",data:volt,borderColor:"#4ade80",borderWidth:2,pointRadius:0},
+        {label:"Tank3 Depth",data:depth,borderColor:"#11cad6",borderWidth:2,pointRadius:0},
+        {label:"Tank3 %",data:pct,borderColor:"#11d65d",borderWidth:2,pointRadius:0},
+        {label:"Tank2 Depth",data:ultra,borderColor:"#0c8e97",borderWidth:2,pointRadius:0},
+        {label:"Tank2 %",data:up,borderColor:"#0c9741",borderWidth:2,pointRadius:0}
+      ]
+    },
+    options:{
+      responsive:true,
+      animation:false,
+      interaction:{mode:"index",intersect:false},
+      plugins:{
+        zoom:{
+          zoom:{wheel:{enabled:true},pinch:{enabled:true},mode:"x"},
+          pan:{enabled:true,mode:"x"}
+        },
+        tooltip:{backgroundColor:"rgba(0,0,0,0.8)",titleColor:"#0ff",bodyColor:"#fff"}
+      },
+      elements:{line:{tension:0.3,borderWidth:3},point:{radius:0}},
+      scales:{
+        x:{ticks:{color:"#0ff"},grid:{color:"rgba(0,255,255,0.1)"}},
+        y:{ticks:{color:"#0ff"},grid:{color:"rgba(0,255,255,0.1)"}}
+      }
+    }
+  });
 }
 
-setInterval(fetchData, 2000);
-fetchData();
+scroll.addEventListener("input",()=>{if(fullHistory.length>=20) drawChart();});
 </script>
 </body>
 </html>
 """
 
-@app.route('/')
-def index():
-    return render_template_string(HTML_PAGE)
+@app.route("/")
+def serve():
+    return HTML
 
-@app.route('/api/current')
-def api_current():
-    return jsonify(latest_data)
-
-@app.route('/api/history')
-def api_history():
-    return jsonify(history)
-
-@app.route('/api/cal')
-def api_cal():
-    return jsonify({"v1":v1,"d1":d1,"v2":v2,"d2":d2})
-
-@app.route('/api/cal1')
-def api_cal1():
-    global v1, d1
-    depth = request.args.get('depth', type=float)
-    if depth is None or "voltage" not in latest_data:
-        return "❌ No voltage data"
-    v1 = latest_data["voltage"]
-    d1 = depth
-    return f"✅ Cal1 set: v1={v1:.4f}, d1={d1}"
-
-@app.route('/api/cal2')
-def api_cal2():
-    global v2, d2
-    depth = request.args.get('depth', type=float)
-    if depth is None or "voltage" not in latest_data:
-        return "❌ No voltage data"
-    v2 = latest_data["voltage"]
-    d2 = depth
-    return f"✅ Cal2 set: v2={v2:.4f}, d2={d2}"
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+if __name__=="__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
