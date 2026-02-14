@@ -2,12 +2,13 @@
 # Smart Water Tank Monitor
 
 Raspberry Pi Pico W → Flask dashboard  
-Measures water depth (via analog sensor) + temperature
+Measures water depth (via analog sensor and/or Ultrasonic Sensor)
 
 ## Hardware
 - Raspberry Pi Pico W
 - Analog depth sensor (ALS-MPM-2F Water Level Transmitter)
 - Temperature sensor (e.g. DS18B20 or onboard)
+- RCWL-1670 Ultrasonic Ranging Module
 
 ## Setup
 
