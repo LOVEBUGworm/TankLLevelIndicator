@@ -1,20 +1,25 @@
 import network
-import socket
 import time
 import json
-from machine import ADC
-import urequests  # For HTTP requests
+from machine import ADC, Pin, time_pulse_us
+import urequests
 
 # ===== WIFI SETTINGS =====
-SSID = "SSID"
-PASSWORD = "Password"
+SSID = "YourWifiSSID"
+PASSWORD = "YorWifiPass"
 
-# ===== SERVER SETTINGS (your computer IP) =====
-SERVER_IP = "192.168.0.x" #192.168.1.x
-SERVER_PORT = 5000  # Changed to match Flask server port
+# ===== SERVER SETTINGS =====
+SERVER_IP = "192.168.0.x"
+SERVER_PORT = 5000
 
-# ===== ADC SETUP =====
-adc = ADC(26)  # GPIO26 = ADC0 on Pico
+# ===== ADC SETUP (Tank 3 Voltage) =====
+adc = ADC(26)  # GPIO26
+
+# ===== ULTRASONIC SETUP (Tank 4) =====
+TRIG = Pin(3, Pin.OUT)
+ECHO = Pin(2, Pin.IN)
+
+# ===== FUNCTIONS =====
 
 def connect_wifi():
     wlan = network.WLAN(network.STA_IF)
@@ -32,14 +37,36 @@ def read_voltage():
     voltage = raw * 3.3 / 65535
     return voltage
 
-def send_data(voltage):
+def read_ultrasonic():
+    # Ensure trigger low
+    TRIG.low()
+    time.sleep_us(2)
+
+    # Send 10us pulse
+    TRIG.high()
+    time.sleep_us(10)
+    TRIG.low()
+
+    try:
+        duration = time_pulse_us(ECHO, 1, 30000)  # 30ms timeout
+        if duration < 0:
+            return None
+
+        # Distance in cm (speed of sound 343m/s)
+        distance_cm = (duration / 2) / 29.1
+        distance_in = distance_cm / 2.54
+        return distance_in
+
+    except:
+        return None
+
+def send_data(voltage, ultra):
     data = {
-        "voltage": voltage,
-        "timestamp": time.time()
+        "value": voltage,
+        "ultra": ultra
     }
 
     try:
-        # Using HTTP POST instead of raw socket
         url = f"http://{SERVER_IP}:{SERVER_PORT}/api/data"
         response = urequests.post(url, json=data)
         print("Sent:", data, "Response:", response.status_code)
@@ -52,5 +79,10 @@ connect_wifi()
 
 while True:
     v = read_voltage()
-    send_data(v)
+    u = read_ultrasonic()
+
+    print("Voltage:", v, "Ultrasonic (in):", u)
+
+    send_data(v, u)
     time.sleep(1)
+
