@@ -1,3 +1,4 @@
+
 from flask import Flask, request, jsonify
 import os
 import json
@@ -282,7 +283,7 @@ h2{text-shadow:0 0 6px #0ff; margin-bottom:12px;}
 
 <!-- SIDE PANEL (slightly constrained width now) -->
 <div class="panel" style="flex:0.1; max-width:420px;">
-  <h2>💧 Tank 3</h2>
+  <h2>💧 PressureTransducer(T3)</h2>
   <div class="tank-bar-container"><div id="tank3-fill" class="tank-bar-fill"></div></div>
   <table>
     <tr><td class="label">Voltage</td><td class="value" id="v">--</td></tr>
@@ -290,7 +291,7 @@ h2{text-shadow:0 0 6px #0ff; margin-bottom:12px;}
     <tr><td class="label">Percent</td><td class="value" id="p">--</td></tr>
   </table>
 
-  <h2 style="margin-top:20px;">🌊 Tank 2</h2>
+  <h2 style="margin-top:20px;">🌊 Ultrasonic Sensor(T2)</h2>
   <div class="tank-bar-container"><div id="tank4-fill" class="tank-bar-fill"></div></div>
   <table>
     <tr><td class="label">Depth (in)</td><td class="value" id="u">--</td></tr>
@@ -457,10 +458,10 @@ function drawChart(){
       labels:labels,
       datasets:[
         {label:"Voltage",data:volt,borderColor:"#4ade80",borderWidth:2,pointRadius:0},
-        {label:"Tank3 Depth",data:depth,borderColor:"#11cad6",borderWidth:2,pointRadius:0},
-        {label:"Tank3 %",data:pct,borderColor:"#11d65d",borderWidth:2,pointRadius:0},
-        {label:"Tank2 Depth",data:ultra,borderColor:"#0c8e97",borderWidth:2,pointRadius:0},
-        {label:"Tank2 %",data:up,borderColor:"#0c9741",borderWidth:2,pointRadius:0}
+        {label:"Pressure Transducer(T3) Depth",data:depth,borderColor:"#bf730d",borderWidth:2,pointRadius:0},
+        {label:"PressureTransducer(T3) %",data:pct,borderColor:"#f58c00",borderWidth:2,pointRadius:0},
+        {label:"Ultrasonic(T2) Depth",data:ultra,borderColor:"#0a6ea6",borderWidth:2,pointRadius:0},
+        {label:"Ultrasonic(T2) %",data:up,borderColor:"#07a3f0",borderWidth:2,pointRadius:0}
       ]
     },
     options:{
