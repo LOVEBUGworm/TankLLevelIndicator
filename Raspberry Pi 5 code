@@ -1,0 +1,30 @@
+from flask import Flask, jsonify
+from gpiozero import Buzzer
+from threading import Thread
+from time import sleep
+
+app = Flask(__name__)
+
+buzzer = Buzzer(17)           
+beep_thread = None
+
+def continuous_beep():
+    buzzer.on()
+    sleep(10.0)
+    buzzer.off()
+
+@app.route('/alarm', methods=['POST'])
+def trigger_alarm():
+    global beep_thread
+
+    # If already beeping, do nothing (prevents overlap)
+    if beep_thread is not None and beep_thread.is_alive():
+        return jsonify({"status": "already_active"}), 409
+
+    beep_thread = Thread(target=continuous_beep, daemon=True)
+    beep_thread.start()
+
+    return jsonify({"status": "alarm_started"})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=6000, debug=False)
