@@ -1,10 +1,10 @@
-
 from flask import Flask, request, jsonify
 import os
 import json
 import time
 from datetime import date
 from threading import Lock
+import requests
 
 app = Flask(__name__)
 
@@ -22,7 +22,19 @@ LOG_DIR = "logs"
 MAX_LOG_DAYS = 7
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# ─── STATE ─────────────────────────────────────────────────────
+# Alarm state tracking to allow only one alert per fill cycle
+alarm_already_fired_this_cycle = False
+
+# ─── ALARM CONFIGURATION ──────────────────────────────────────
+ALARM_PI_IP = "192.168.0.118"          
+ALARM_ENDPOINT = f"http://{ALARM_PI_IP}:6000/alarm"
+ALARM_LOW_THRESHOLD_IN = 32.4          # trigger when remaining depth ≤ this
+ALARM_HIGH_THRESHOLD_IN = 34.5         # do not trigger again until depth > this
+ALARM_COOLDOWN_SECONDS = 7200         
+
+last_alarm_time = 0.0
+
+# ─── STATE ───────────────────────────────────────
 stats_lock = Lock()
 file_lock  = Lock()
 
@@ -36,7 +48,7 @@ stats = {
     "min_up": None, "max_up": None
 }
 
-# ─── HELPERS ───────────────────────────────────────────────────
+# ─── HELPERS ──────────────────────────────────────────────
 def today_filename():
     return os.path.join(LOG_DIR, date.today().isoformat() + ".json")
 
@@ -98,52 +110,117 @@ def update_stats(v, d, p, up):
         upd("min_up", up, "min")
         upd("max_up", up, "max")
 
-# ─── API ───────────────────────────────────────────────────────
+# ─── API ────────────────────────────────────────────────
 @app.route("/api/data", methods=["POST"])
 def receive_data():
+    """
+    Receives sensor data (voltage and optional ultrasonic reading),
+    processes it, updates statistics, logs the entry, checks for low-level alarm,
+    and returns a success response.
+    """
     payload = request.get_json(silent=True)
     if not payload:
-        return jsonify({"error": "missing payload"}), 400
+        return jsonify({"error": "missing or invalid JSON payload"}), 400
 
-    raw_v = payload.get("value")
-    raw_ultra = payload.get("ultra")
+    # ─── 1. Extract and validate raw inputs ───────────────────────────────
+    raw_voltage = payload.get("value")
+    raw_ultra   = payload.get("ultra")
 
-    smooth_v = safe_filter_voltage(raw_v) if raw_v is not None else 0
-    depth, pct = voltage_to_depth_pct(smooth_v)
+    # ─── 2. Apply filtering to reduce noise ───────────────────────────────
+    smoothed_voltage = safe_filter_voltage(raw_voltage) if raw_voltage is not None else 0.0
+    smoothed_ultra   = safe_filter_ultra(raw_ultra)     if raw_ultra   is not None else None
 
-    if raw_ultra is not None:
-        smooth_ultra = safe_filter_ultra(raw_ultra)
-        tank4_depth = max(0.0, min(TANK4_DEPTH_IN - smooth_ultra, TANK4_DEPTH_IN))
-        tank4_pct = (tank4_depth / TANK4_DEPTH_IN) * 100
-    else:
-        tank4_depth = None
-        tank4_pct = None
+    # ─── 3. Convert voltage → tank 1 depth & percentage ───────────────────
+    tank1_depth_cm, tank1_pct = voltage_to_depth_pct(smoothed_voltage)
 
-    update_stats(smooth_v, depth, pct, tank4_pct)
+    # ─── 4. Convert ultrasonic → tank 4 remaining depth & percentage ─────
+    tank4_remaining_in = None
+    tank4_pct          = None
 
+    if smoothed_ultra is not None:
+        # Ultrasonic typically measures distance from sensor to surface
+        tank4_remaining_in = max(0.0, min(TANK4_DEPTH_IN - smoothed_ultra, TANK4_DEPTH_IN))
+        tank4_pct = (tank4_remaining_in / TANK4_DEPTH_IN) * 100
+
+    # ─── 5. Update running statistics ─────────────────────────────────────
+    update_stats(
+        v  = smoothed_voltage,
+        d  = tank1_depth_cm,
+        p  = tank1_pct,
+        up = tank4_pct
+    )
+
+   
+    # ─── 6. High-water alarm logic ───────────────────────────────────────
+    alarm_triggered = False
+
+    if tank4_remaining_in is not None:
+        now = time.time()
+        global last_alarm_time
+        global alarm_already_fired_this_cycle
+
+        in_danger_zone = (
+            ALARM_LOW_THRESHOLD_IN <= tank4_remaining_in <= ALARM_HIGH_THRESHOLD_IN
+        )
+
+        # Reset the "already fired" flag when we leave the danger zone
+        # (i.e., headspace becomes > 36.0 in or < 35.0 in)
+        if not in_danger_zone:
+            alarm_already_fired_this_cycle = False
+
+        # Trigger only if:
+        # - Currently in the danger zone
+        # - We have NOT already alerted during this high-water period
+        # - Enough time has passed since the very last alarm (safety net)
+        if (
+            in_danger_zone
+            and not alarm_already_fired_this_cycle
+            and now - last_alarm_time >= ALARM_COOLDOWN_SECONDS
+        ):
+            try:
+                response = requests.post(ALARM_ENDPOINT, timeout=4.0)
+                response.raise_for_status()
+                last_alarm_time = now
+                alarm_already_fired_this_cycle = True
+                alarm_triggered = True
+                print(f"High water alarm triggered (first in cycle) → remaining: {tank4_remaining_in:.2f} in")
+            except requests.RequestException as exc:
+                print(f"Failed to trigger alarm: {exc}")
+    # Optional: log whether alarm was sent in this reading    # ─── 7. Prepare log entry ─────────────────────────────────────────────
     entry = {
-        "t": time.time(),
-        "v": round(smooth_v, 4),
-        "d": round(depth, 2),
-        "p": round(pct, 1),
-        "u": round(tank4_depth, 2) if tank4_depth is not None else None,
-        "up": round(tank4_pct, 1) if tank4_pct is not None else None
+        "t":     time.time(),
+        "v":     round(smoothed_voltage, 4),
+        "d":     round(tank1_depth_cm, 2),
+        "p":     round(tank1_pct, 1),
+        "u":     round(tank4_remaining_in, 2) if tank4_remaining_in is not None else None,
+        "up":    round(tank4_pct, 1)         if tank4_pct         is not None else None,
+        "alarm": alarm_triggered
     }
 
+    # ─── 8. Append to today's log file ────────────────────────────────────
     fname = today_filename()
+
     with file_lock:
         data = []
         if os.path.exists(fname):
             try:
-                with open(fname, "r") as f:
+                with open(fname, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            except:
-                data = []
-        data.append(entry)
-        with open(fname, "w") as f:
-            json.dump(data, f, separators=(",", ":"))
+            except (json.JSONDecodeError, IOError):
+                data = []  # corrupt file → start fresh
 
+        data.append(entry)
+
+        try:
+            with open(fname, "w", encoding="utf-8") as f:
+                json.dump(data, f, separators=(",", ":"))
+        except IOError as exc:
+            print(f"Failed to write log file {fname}: {exc}")
+            # We still return success to the device so it keeps sending data
+
+    # ─── 9. Clean up old logs (non-blocking) ──────────────────────────────
     cleanup_old_logs()
+
     return jsonify({"status": "ok"})
 
 @app.route("/api/current")
