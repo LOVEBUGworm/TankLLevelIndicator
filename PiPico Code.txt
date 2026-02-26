@@ -1,88 +1,114 @@
 import network
 import time
-import json
-from machine import ADC, Pin, time_pulse_us
+import gc
+import machine
+from machine import ADC, Pin, time_pulse_us, WDT
 import urequests
 
-# ===== WIFI SETTINGS =====
-SSID = "YourWifiSSID"
-PASSWORD = "YorWifiPass"
-
-# ===== SERVER SETTINGS =====
-SERVER_IP = "192.168.0.x"
+# ===== SETTINGS =====
+SSID = "SSID"
+PASSWORD = "Password"
+SERVER_IP = "192.168.0.178"
 SERVER_PORT = 5000
 
-# ===== ADC SETUP (Tank 3 Voltage) =====
-adc = ADC(26)  # GPIO26
-
-# ===== ULTRASONIC SETUP (Tank 4) =====
+# ===== HARDWARE =====
+adc = ADC(26)
 TRIG = Pin(3, Pin.OUT)
 ECHO = Pin(2, Pin.IN)
+wdt = WDT(timeout=8000)  
 
-# ===== FUNCTIONS =====
+REQUEST_TIMEOUT = 4.0     
 
+# ===== WIFI =====
 def connect_wifi():
     wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
-    wlan.connect(SSID, PASSWORD)
+    if wlan.isconnected():
+        return wlan
 
     print("Connecting to WiFi...")
+    wlan.active(True)
+    
+    # limit reconnect attempts per call (MicroPython ≥ v1.20)
+    # wlan.config(reconnects=3) 
+
+    wlan.connect(SSID, PASSWORD)
+    
+    timeout = 15
+    start = time.time()
     while not wlan.isconnected():
+        if time.time() - start > timeout:
+            print("WiFi connection timeout → resetting")
+            time.sleep(1)
+            machine.reset()
+        wdt.feed()           
         time.sleep(0.5)
+    
+    print("Connected:", wlan.ifconfig()[0])
+    return wlan
 
-    print("Connected! IP:", wlan.ifconfig()[0])
-
+# ===== SENSORS =====
 def read_voltage():
     raw = adc.read_u16()
-    voltage = raw * 3.3 / 65535
-    return voltage
+    return raw * 3.3 / 65535
 
 def read_ultrasonic():
-    # Ensure trigger low
     TRIG.low()
     time.sleep_us(2)
-
-    # Send 10us pulse
     TRIG.high()
     time.sleep_us(10)
     TRIG.low()
-
     try:
-        duration = time_pulse_us(ECHO, 1, 30000)  # 30ms timeout
+        duration = time_pulse_us(ECHO, 1, 30000)
         if duration < 0:
             return None
-
-        # Distance in cm (speed of sound 343m/s)
         distance_cm = (duration / 2) / 29.1
-        distance_in = distance_cm / 2.54
-        return distance_in
-
+        return distance_cm / 2.54
     except:
         return None
 
+# ===== SEND =====
 def send_data(voltage, ultra):
-    data = {
-        "value": voltage,
-        "ultra": ultra
-    }
-
+    url = f"http://{SERVER_IP}:{SERVER_PORT}/api/data"
+    payload = {"value": voltage, "ultra": ultra}
+    
     try:
-        url = f"http://{SERVER_IP}:{SERVER_PORT}/api/data"
-        response = urequests.post(url, json=data)
-        print("Sent:", data, "Response:", response.status_code)
+        
+        response = urequests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         response.close()
+        return True
+    except OSError as e:
+       
+        print("Request failed (OSError):", e)
+        return False
     except Exception as e:
-        print("Send error:", e)
+        print("Request exception:", e)
+        return False
+    finally:
+        gc.collect()
 
-# ===== MAIN LOOP =====
-connect_wifi()
+# ===== MAIN =====
+wlan = connect_wifi()
 
 while True:
-    v = read_voltage()
-    u = read_ultrasonic()
+    wdt.feed()
 
-    print("Voltage:", v, "Ultrasonic (in):", u)
+   
+    if not wlan.isconnected():
+        print("WiFi disconnected → reconnecting")
+        wlan = connect_wifi()           
 
-    send_data(v, u)
+    voltage = read_voltage()
+    ultra   = read_ultrasonic()
+    
+    print(f"V: {voltage:.3f}   U: {ultra if ultra is not None else 'None'}")
+
+    success = send_data(voltage, ultra)
+    
+   
+    if not success:
+        gc.collect()
+        time.sleep(0.1)     
+        gc.collect()
+
+    wdt.feed()
     time.sleep(1)
-
